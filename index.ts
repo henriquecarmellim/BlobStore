@@ -118,7 +118,7 @@ async function handleGet(req: Request, filePath: string, key: string): Promise<R
   const url = new URL(req.url);
 
   if (url.searchParams.get("info") === "true") {
-    let fileStat: Awaited<ReturnType<typeof stat>>;
+    let fileStat;
     try {
       fileStat = await stat(filePath);
     } catch {
@@ -128,8 +128,8 @@ async function handleGet(req: Request, filePath: string, key: string): Promise<R
     return Response.json({
       status: "success",
       response: {
-        name     : key,
-        size     : fileStat.size,
+        name: key,
+        size: fileStat.size,
         createdAt: fileStat.birthtime,
       },
     });
@@ -141,7 +141,7 @@ async function handleGet(req: Request, filePath: string, key: string): Promise<R
 
   return new Response(file, {
     headers: {
-      "Cache-Control"      : "public, max-age=31536000, immutable",
+      "Cache-Control": "public, max-age=31536000, immutable",
       "Content-Disposition": `inline; filename="${key}"`,
     },
   });
@@ -164,25 +164,27 @@ Bun.serve({
   port: PORT,
 
   async fetch(req) {
-    // 🔒 Autenticação global — bloqueia tudo sem token válido
+    const url = new URL(req.url);
+    const parts = url.pathname.split("/").filter(Boolean);
+
+    if (req.method === "GET" && parts[0] === "v1" && parts[1] === "blobs" && parts[2]) {
+      const key = parts[2];
+      const filePath = resolvePath(key);
+      return handleGet(req, filePath, key);
+    }
+
     if (!isAuthorized(req)) {
       return errorResponse("Unauthorized", 401);
     }
 
-    const url   = new URL(req.url);
-    const parts = url.pathname.split("/").filter(Boolean);
-
-    // POST /v1/blobs/upload
     if (req.method === "POST" && url.pathname === "/v1/blobs/upload") {
       return handleUpload(req);
     }
 
-    // /v1/blobs/:key
     if (parts[0] === "v1" && parts[1] === "blobs" && parts[2]) {
-      const key      = parts[2];
+      const key = parts[2];
       const filePath = resolvePath(key);
 
-      if (req.method === "GET")    return handleGet(req, filePath, key);
       if (req.method === "DELETE") return handleDelete(filePath);
 
       return errorResponse("Method not allowed", 405);
