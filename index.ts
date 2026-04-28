@@ -1,4 +1,4 @@
-import { mkdir, stat, unlink } from "node:fs/promises";
+import { mkdir, stat, unlink, writeFile, readFile } from "node:fs/promises";
 import { join, basename } from "node:path";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -23,43 +23,35 @@ console.log(`🔒 Auth    : Bearer token ativo\n`);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Sanitiza um nome de arquivo — nunca permite path traversal. */
 function sanitizeName(raw: string): string {
   return basename(raw).replace(/[^a-zA-Z0-9.\-_]/g, "_") || "file";
 }
 
-/** Gera uma key única e segura para o arquivo. */
 function generateKey(originalName: string): string {
   const safe = sanitizeName(originalName);
   return `${Date.now()}-${crypto.randomUUID()}-${safe}`;
 }
 
-/** Resolve o caminho absoluto de uma key, garantindo que fique dentro do STORAGE_PATH. */
 function resolvePath(key: string): string {
-  const safe = basename(key);
-  return join(STORAGE_PATH, safe);
+  return join(STORAGE_PATH, basename(key));
 }
 
-/** Serializa qualquer erro em string legível. */
+function metaPath(key: string): string {
+  return resolvePath(key) + ".meta.json";
+}
+
 function errMsg(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  return String(e);
+  return e instanceof Error ? e.message : String(e);
 }
 
-/** Resposta JSON padronizada para erros. */
 function errorResponse(message: string, status: number): Response {
   return Response.json({ status: "error", message }, { status });
 }
 
-/**
- * Valida o Bearer token da requisição.
- * Usa comparação em tempo constante para evitar timing attacks.
- */
 function isAuthorized(req: Request): boolean {
   const header = req.headers.get("authorization") ?? "";
   const token  = header.startsWith("Bearer ") ? header.slice(7) : "";
 
-  // Timing-safe: compara byte a byte sem curto-circuito
   if (token.length !== AUTH_TOKEN!.length) return false;
 
   let mismatch = 0;
@@ -69,16 +61,11 @@ function isAuthorized(req: Request): boolean {
   return mismatch === 0;
 }
 
-// ─── Handlers ─────────────────────────────────────────────────────────────────
+// ─── Upload ───────────────────────────────────────────────────────────────────
 
-/** POST /v1/blobs/upload */
 async function handleUpload(req: Request): Promise<Response> {
-  const contentLength = Number(req.headers.get("content-length") ?? 0);
-  if (contentLength > MAX_BYTES) {
-    return errorResponse(`File too large. Max allowed: ${MAX_BYTES} bytes`, 413);
-  }
-
   let formData: FormData;
+
   try {
     formData = await req.formData();
   } catch {
@@ -92,11 +79,19 @@ async function handleUpload(req: Request): Promise<Response> {
     return errorResponse(`File too large. Max allowed: ${MAX_BYTES} bytes`, 413);
   }
 
-  const key       = generateKey(file.name);
-  const finalPath = resolvePath(key);
+  const key = generateKey(file.name);
+  const filePath = resolvePath(key);
+  const metaFile = metaPath(key);
 
   try {
-    await Bun.write(finalPath, file);
+    await Bun.write(filePath, file);
+
+    await writeFile(metaFile, JSON.stringify({
+      originalName: file.name,
+      type: file.type,
+      size: file.size,
+      createdAt: new Date().toISOString()
+    }));
   } catch (e) {
     return errorResponse(`Failed to save file: ${errMsg(e)}`, 500);
   }
@@ -104,40 +99,51 @@ async function handleUpload(req: Request): Promise<Response> {
   return Response.json({
     status: "success",
     response: {
-      name : file.name,
-      type : file.type,
-      size : file.size,
+      name: file.name,
+      type: file.type,
+      size: file.size,
       key,
-      url  : `${BASE_URL}/v1/blobs/${key}`,
+      url: `${BASE_URL}/v1/blobs/${key}`,
     },
   });
 }
 
-/** GET /v1/blobs/:key */
+// ─── GET ──────────────────────────────────────────────────────────────────────
+
 async function handleGet(req: Request, filePath: string, key: string): Promise<Response> {
   const url = new URL(req.url);
+  const info = url.searchParams.get("info") === "true";
 
-  if (url.searchParams.get("info") === "true") {
-    let fileStat;
+  // 🔒 INFO agora é protegido
+  if (info) {
+    if (!isAuthorized(req)) {
+      return errorResponse("Unauthorized", 401);
+    }
+
     try {
-      fileStat = await stat(filePath);
+      const fileStat = await stat(filePath);
+      const metaRaw = await readFile(metaPath(key), "utf-8").catch(() => null);
+
+      const meta = metaRaw ? JSON.parse(metaRaw) : null;
+
+      return Response.json({
+        status: "success",
+        response: {
+          key,
+          size: fileStat.size,
+          createdAt: meta?.createdAt ?? fileStat.birthtime,
+          originalName: meta?.originalName ?? key,
+        },
+      });
     } catch {
       return errorResponse("File not found", 404);
     }
-
-    return Response.json({
-      status: "success",
-      response: {
-        name: key,
-        size: fileStat.size,
-        createdAt: fileStat.birthtime,
-      },
-    });
   }
 
   const file = Bun.file(filePath);
-  const exists = await file.exists();
-  if (!exists) return errorResponse("File not found", 404);
+  if (!(await file.exists())) {
+    return errorResponse("File not found", 404);
+  }
 
   return new Response(file, {
     headers: {
@@ -147,13 +153,15 @@ async function handleGet(req: Request, filePath: string, key: string): Promise<R
   });
 }
 
-/** DELETE /v1/blobs/:key */
-async function handleDelete(filePath: string): Promise<Response> {
+// ─── DELETE ───────────────────────────────────────────────────────────────────
+
+async function handleDelete(filePath: string, key: string): Promise<Response> {
   try {
-    await unlink(filePath);
+    await unlink(filePath).catch(() => {});
+    await unlink(metaPath(key)).catch(() => {});
+
     return Response.json({ status: "success", message: "File deleted successfully" });
-  } catch (e: any) {
-    if (e?.code === "ENOENT") return errorResponse("File not found", 404);
+  } catch (e) {
     return errorResponse(`Failed to delete file: ${errMsg(e)}`, 500);
   }
 }
@@ -167,12 +175,18 @@ Bun.serve({
     const url = new URL(req.url);
     const parts = url.pathname.split("/").filter(Boolean);
 
-    if (req.method === "GET" && parts[0] === "v1" && parts[1] === "blobs" && parts[2]) {
-      const key = parts[2];
-      const filePath = resolvePath(key);
-      return handleGet(req, filePath, key);
+    // 🚫 bloqueia rota ambígua /upload antes de cair no blob handler
+    if (url.pathname === "/v1/blobs/upload" && req.method === "GET") {
+      return errorResponse("Not Found", 404);
     }
 
+    // GET público do arquivo
+    if (req.method === "GET" && parts[0] === "v1" && parts[1] === "blobs" && parts[2]) {
+      const key = parts[2];
+      return handleGet(req, resolvePath(key), key);
+    }
+
+    // tudo abaixo exige auth
     if (!isAuthorized(req)) {
       return errorResponse("Unauthorized", 401);
     }
@@ -185,7 +199,9 @@ Bun.serve({
       const key = parts[2];
       const filePath = resolvePath(key);
 
-      if (req.method === "DELETE") return handleDelete(filePath);
+      if (req.method === "DELETE") {
+        return handleDelete(filePath, key);
+      }
 
       return errorResponse("Method not allowed", 405);
     }
