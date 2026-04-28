@@ -1,4 +1,4 @@
-const API_URL = "http://localhost:3000/v1/blobs";
+const API_URL = "http://192.168.15.20:16020/v1/blobs";
 const TEST_FILE_NAME = "teste_parrudo.txt";
 const TEST_CONTENT = "Conteudo de teste para validar o armazenamento no TrueNAS " + Date.now();
 
@@ -26,7 +26,7 @@ async function runTests() {
     // --- 2. TESTE DE INFO (Metadados) ---
     console.log("\nℹ️ [2/4] Testando Busca de Informações...");
     const infoRes = await fetch(`${API_URL}/${fileKey}?info=true`);
-    const infoData = await infoRes.json();
+    const infoData = await infoRes.json();|
     
     if (infoData.status === "success") {
       console.log(`✅ Info OK! Tamanho detectado: ${infoData.response.size} bytes`);
