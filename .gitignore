@@ -1,3 +1,9 @@
+#testes
+script
+storage
+./storage
+./script
+
 # Logs
 logs
 *.log
