@@ -6,13 +6,20 @@ import { join, basename } from "node:path";
 const STORAGE_PATH = Bun.env.STORAGE_PATH || "/mnt/storage";
 const PORT         = Number(Bun.env.PORT)  || 3000;
 const BASE_URL     = Bun.env.BASE_URL      || `http://localhost:${PORT}`;
-const MAX_BYTES    = Number(Bun.env.MAX_FILE_BYTES) || 50 * 1024 * 1024; // 50 MB padrão
+const MAX_BYTES    = (Number(Bun.env.MAX_FILE_SIZE_MB) || 50) * 1024 * 1024;
+const AUTH_TOKEN   = Bun.env.AUTH_TOKEN;
+
+if (!AUTH_TOKEN) {
+  console.error("❌ AUTH_TOKEN não definido no .env — abortando por segurança.");
+  process.exit(1);
+}
 
 await mkdir(STORAGE_PATH, { recursive: true });
 
 console.log(`⚡ BlobStore API | Operacional`);
 console.log(`📂 Storage : ${STORAGE_PATH}`);
-console.log(`📦 Limite  : ${(MAX_BYTES / 1024 / 1024).toFixed(0)} MB\n`);
+console.log(`📦 Limite  : ${(MAX_BYTES / 1024 / 1024).toFixed(0)} MB`);
+console.log(`🔒 Auth    : Bearer token ativo\n`);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -29,7 +36,7 @@ function generateKey(originalName: string): string {
 
 /** Resolve o caminho absoluto de uma key, garantindo que fique dentro do STORAGE_PATH. */
 function resolvePath(key: string): string {
-  const safe = basename(key); // impede ../../ na key
+  const safe = basename(key);
   return join(STORAGE_PATH, safe);
 }
 
@@ -44,17 +51,31 @@ function errorResponse(message: string, status: number): Response {
   return Response.json({ status: "error", message }, { status });
 }
 
+/**
+ * Valida o Bearer token da requisição.
+ * Usa comparação em tempo constante para evitar timing attacks.
+ */
+function isAuthorized(req: Request): boolean {
+  const header = req.headers.get("authorization") ?? "";
+  const token  = header.startsWith("Bearer ") ? header.slice(7) : "";
+
+  // Timing-safe: compara byte a byte sem curto-circuito
+  if (token.length !== AUTH_TOKEN!.length) return false;
+
+  let mismatch = 0;
+  for (let i = 0; i < token.length; i++) {
+    mismatch |= token.charCodeAt(i) ^ AUTH_TOKEN!.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /** POST /v1/blobs/upload */
 async function handleUpload(req: Request): Promise<Response> {
-  // 1. Valida tamanho pelo header antes de ler o body
   const contentLength = Number(req.headers.get("content-length") ?? 0);
   if (contentLength > MAX_BYTES) {
-    return errorResponse(
-      `File too large. Max allowed: ${MAX_BYTES} bytes`,
-      413
-    );
+    return errorResponse(`File too large. Max allowed: ${MAX_BYTES} bytes`, 413);
   }
 
   let formData: FormData;
@@ -67,12 +88,8 @@ async function handleUpload(req: Request): Promise<Response> {
   const file = formData.get("file") as File | null;
   if (!file) return errorResponse("No file uploaded", 400);
 
-  // 2. Segunda barreira de tamanho (após parse real)
   if (file.size > MAX_BYTES) {
-    return errorResponse(
-      `File too large. Max allowed: ${MAX_BYTES} bytes`,
-      413
-    );
+    return errorResponse(`File too large. Max allowed: ${MAX_BYTES} bytes`, 413);
   }
 
   const key       = generateKey(file.name);
@@ -97,15 +114,10 @@ async function handleUpload(req: Request): Promise<Response> {
 }
 
 /** GET /v1/blobs/:key */
-async function handleGet(
-  req: Request,
-  filePath: string,
-  key: string
-): Promise<Response> {
+async function handleGet(req: Request, filePath: string, key: string): Promise<Response> {
   const url = new URL(req.url);
 
   if (url.searchParams.get("info") === "true") {
-    // Metadados — precisa do stat
     let fileStat: Awaited<ReturnType<typeof stat>>;
     try {
       fileStat = await stat(filePath);
@@ -123,15 +135,13 @@ async function handleGet(
     });
   }
 
-  // Download — Bun.file já trata ausência do arquivo com status 404 nativo
   const file = Bun.file(filePath);
   const exists = await file.exists();
   if (!exists) return errorResponse("File not found", 404);
 
   return new Response(file, {
     headers: {
-      // Imutável: a key já carrega timestamp + UUID, nunca reutilizada
-      "Cache-Control": "public, max-age=31536000, immutable",
+      "Cache-Control"      : "public, max-age=31536000, immutable",
       "Content-Disposition": `inline; filename="${key}"`,
     },
   });
@@ -154,9 +164,13 @@ Bun.serve({
   port: PORT,
 
   async fetch(req) {
-    const url       = new URL(req.url);
-    const parts     = url.pathname.split("/").filter(Boolean);
-    // parts esperados: ["v1", "blobs", <key?>]
+    // 🔒 Autenticação global — bloqueia tudo sem token válido
+    if (!isAuthorized(req)) {
+      return errorResponse("Unauthorized", 401);
+    }
+
+    const url   = new URL(req.url);
+    const parts = url.pathname.split("/").filter(Boolean);
 
     // POST /v1/blobs/upload
     if (req.method === "POST" && url.pathname === "/v1/blobs/upload") {
